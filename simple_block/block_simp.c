@@ -49,31 +49,89 @@ static const struct block_device_operations srd_ops = {
 // --- I/O Handling ---
 static void srd_handle_bio(struct simple_ramdisk *dev, struct bio *bio)
 {
-    struct bvec_iter iter = bio->bi_iter; // Get the iterator from the BIO
-    sector_t sector_off = iter.bi_sector; // Starting sector
-    size_t dev_offset = sector_off * SRD_SECTOR_SIZE; // Byte offset in our RAM buffer
+    struct bvec_iter iter;
+    sector_t sector_off;
+    size_t dev_offset;
 
-    do {
-        struct bio_vec bvec = bio_iter_iovec(bio, iter); // Get current bio_vec segment
-        size_t len = bvec.bv_len;
-        unsigned char *ram_addr;
-        unsigned char *bio_addr;
+    // Check if bio itself is sane first
+    if (!bio) {
+        pr_err("%s: Received NULL BIO!\n", SRD_DEVICE_NAME);
+        return;
+    }
 
-        // Check bounds for this segment
-        if (dev_offset + len > dev->size) {
-            printk("%s: Access beyond end of device (sector %llu, offset %zu, len %zu > size %zu)\n",
-                   SRD_DEVICE_NAME, (unsigned long long)sector_off, dev_offset, len, dev->size);
-            bio->bi_status = BLK_STS_IOERR;
-            break; // Error for this segment (and thus BIO)
+    iter = bio->bi_iter; // Get the iterator from the BIO
+    sector_off = iter.bi_sector; // Starting sector
+    dev_offset = sector_off * SRD_SECTOR_SIZE; // Byte offset in our RAM buffer
+
+    // For DISCARD/WRITE_ZEROES, bi_io_vec might be NULL or segments might be empty.
+    // We still need to process the range, but not necessarily map pages.
+    if (bio_op(bio) == REQ_OP_DISCARD || bio_op(bio) == REQ_OP_WRITE_ZEROES) {
+        // For these operations, we just care about the range given by bio->bi_iter
+        size_t total_len_to_process = iter.bi_size; // total size in bytes for the DISCARD/ZERO op
+
+        if (total_len_to_process == 0) { // Nothing to do
+            bio->bi_status = BLK_STS_OK;
+            return;
         }
 
-        // Get kernel virtual address for the BIO's page
-        bio_addr = kmap_local_page(bvec.bv_page) + bvec.bv_offset;
-        ram_addr = dev->data + dev_offset; // Address in our RAM buffer
+        // Check bounds for the entire operation
+        if (dev_offset + total_len_to_process > dev->size) {
+            pr_err("%s: DISCARD/ZERO Access beyond end of device (sector %llu, offset %zu, len %zu > size %zu)\n",
+                   SRD_DEVICE_NAME, (unsigned long long)sector_off, dev_offset, total_len_to_process, dev->size);
+            bio->bi_status = BLK_STS_IOERR;
+            return;
+        }
 
-        // --- Perform Read/Write/Discard ---
         spin_lock(&dev->lock);
-        switch (bio_op(bio)) {
+        memset(dev->data + dev_offset, 0, total_len_to_process);
+        spin_unlock(&dev->lock);
+
+        printk(KERN_DEBUG "%s: Discard/Zero %zu bytes at offset %zu\n", SRD_DEVICE_NAME, total_len_to_process, dev_offset);
+        bio->bi_status = BLK_STS_OK;
+        return; // Handled, no need to iterate bio_vecs
+    }
+
+    // For other operations (READ/WRITE), bi_io_vec should be valid.
+    // It's still good practice to check bio->bi_io_vec before using it.
+    if (!bio->bi_io_vec) {
+        pr_err("%s: bio->bi_io_vec is NULL for non-discard/zero op %u, sector %llu\n",
+               SRD_DEVICE_NAME, bio_op(bio), (unsigned long long)sector_off);
+        bio->bi_status = BLK_STS_IOERR;
+        return;
+    }
+
+    // Proceed with the loop for READ/WRITE
+    do {
+        struct bio_vec bvec = bio_iter_iovec(bio, iter); // Should be safe now for R/W
+        size_t len = bvec.bv_len;
+        unsigned char *ram_addr;
+        unsigned char *bio_addr = NULL;
+
+        if (len == 0) { // Skip zero-length segments
+            bio_advance_iter_single(bio, &iter, 0);
+            continue;
+        }
+
+        if (dev_offset + len > dev->size) {
+            pr_err("%s: Access beyond end of device (sector %llu, offset %zu, len %zu > size %zu)\n",
+                   SRD_DEVICE_NAME, (unsigned long long)sector_off, dev_offset, len, dev->size);
+            bio->bi_status = BLK_STS_IOERR;
+            break;
+        }
+
+        ram_addr = dev->data + dev_offset;
+
+        // bio_op should only be READ or WRITE here due to earlier check
+        if (!bvec.bv_page) {
+            pr_err("%s: NULL page in BIO for Read/Write op at sector %llu\n",
+                   SRD_DEVICE_NAME, (unsigned long long)sector_off);
+            bio->bi_status = BLK_STS_IOERR;
+            break;
+        }
+        bio_addr = kmap_local_page(bvec.bv_page) + bvec.bv_offset;
+
+        spin_lock(&dev->lock);
+        switch (bio_op(bio)) { // Should only be READ or WRITE
             case REQ_OP_READ:
                 memcpy(bio_addr, ram_addr, len);
                 printk(KERN_DEBUG "%s: Read %zu bytes at offset %zu\n", SRD_DEVICE_NAME, len, dev_offset);
@@ -82,34 +140,27 @@ static void srd_handle_bio(struct simple_ramdisk *dev, struct bio *bio)
                 memcpy(ram_addr, bio_addr, len);
                 printk(KERN_DEBUG "%s: Write %zu bytes at offset %zu\n", SRD_DEVICE_NAME, len, dev_offset);
                 break;
-            case REQ_OP_DISCARD:
-            case REQ_OP_WRITE_ZEROES:
-                memset(ram_addr, 0, len);
-                printk(KERN_DEBUG "%s: Discard/Zero %zu bytes at offset %zu\n", SRD_DEVICE_NAME, len, dev_offset);
-                break;
             default:
-                pr_warn("%s: Unsupported BIO operation: %d\n", SRD_DEVICE_NAME, bio_op(bio));
-                spin_unlock(&dev->lock);
-                kunmap_local(bio_addr); // Unmap before erroring out
-                bio->bi_status = BLK_STS_IOERR; // Mark BIO with error
-                goto bio_loop_end; // Exit loop on error
+                // This case should ideally not be reached if the logic above is correct
+                pr_warn("%s: Unexpected BIO operation in R/W loop: %d\n", SRD_DEVICE_NAME, bio_op(bio));
+                bio->bi_status = BLK_STS_IOERR;
+                break;
         }
         spin_unlock(&dev->lock);
 
-        // Clean up mapping for this segment
-        kunmap_local(bio_addr);
+        if (bio_addr) {
+            kunmap_local(bio_addr);
+        }
 
-        // Move to the next offset in our RAM buffer AND advance iterator
+        if (bio->bi_status != BLK_STS_OK) {
+             break;
+        }
+
         dev_offset += len;
-        bio_advance_iter_single(bio, &iter, len); // Advance the iterator
+        bio_advance_iter_single(bio, &iter, len);
 
-    } while (iter.bi_size > 0); // Continue while there's more data in the BIO
+    } while (iter.bi_size > 0);
 
-bio_loop_end:
-    // If status wasn't already set to error during the loop, mark as OK
-    if (bio->bi_status == BLK_STS_OK) {
-        bio->bi_status = BLK_STS_OK; // No error encountered
-    }
     return;
 }
 
